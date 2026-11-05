@@ -12,26 +12,25 @@ The motivation and architectural decisions come from the meeting ([TRANSCRICAO.m
 
 1. **Keep order writes atomic with eligible event capture.** A committed order operation must have its eligible outbox records; a rollback must leave neither the order-side changes nor an outbox record.
 2. **Keep customer HTTP availability outside order transactions.** No customer request is made from the API request or inside the Prisma order transaction.
-3. **Meet the agreed discovery cadence.** Run one separate worker that polls every two seconds, claiming at most 10 due records per batch, oldest first.
-4. **Send verifiable, bounded requests.** Use HTTPS, the endpoint-specific HMAC-SHA256 secret, a 10-second HTTP timeout, and a 64 KiB serialized-body limit.
-5. **Make delivery semantics explicit.** Provide at-least-once delivery with a stable event UUID. The initial send is followed by five retries at the agreed delays; duplicates are possible.
+3. **Meet the agreed discovery cadence.** Run one separate worker that polls every two seconds and processes older pending records first. The batch size remains undecided.
+4. **Send verifiable, bounded requests.** Use HTTPS, the endpoint-specific HMAC-SHA256 secret, a 10-second HTTP timeout, and the agreed 64 KB serialized-body ceiling; confirm its exact byte interpretation before implementation.
+5. **Make delivery semantics explicit.** Provide at-least-once delivery with a stable event UUID. Use the agreed retry-delay sequence; resolve the attempt count and DLQ threshold before implementation.
 6. **Make failures diagnosable and recoverable.** Persist every HTTP attempt, expose the latest 100 attempts for an endpoint, move exhausted events into a separate DLQ, and record administrator replays.
 7. **Reuse existing application conventions.** Use the current module layout, authentication, Zod validation, `AppError` response shape, Pino logger, and Prisma database configuration.
 
-The sub-10-second customer experience is a product objective, not a hard delivery guarantee: the outbox is polled every two seconds, but endpoint latency, timeouts, backlog, and retries can delay successful delivery. The PRD's first-attempt target is at least 95% of eligible events receiving a 2xx response within 10 seconds; the implementation should measure this rather than claim it is guaranteed.
+The sub-10-second customer experience is a product objective, not a hard delivery guarantee: the outbox is polled every two seconds, but endpoint latency, timeouts, backlog, and retries can delay successful delivery. Measure source-event-to-first-success latency and report the share meeting the under-10-second expectation; the meeting specifies no percentage SLO.
 
 ## 3. Scope and Exclusions
 
 ### Included
 
 - Customer-scoped configuration of HTTPS webhook endpoints, with status filters, active state, generated endpoint-specific secrets, and secret rotation.
-- `order.created` events for endpoints subscribed to `PENDING`.
 - `order.status_changed` events for endpoints subscribed to the new order status.
 - Transactional MySQL outbox insertion, storing the serialized payload snapshot at source-event time.
-- A separate single-worker process, 2-second polling, 10-record batches, oldest-first processing, and a 30-second processing lease.
-- HMAC-SHA256 request signing, encrypted secret persistence, endpoint/network destination checks, a 10-second HTTP timeout, and the 64 KiB payload ceiling.
-- Six total sends per retry cycle: one initial send followed by five retries after 1 minute, 5 minutes, 30 minutes, 2 hours, and 12 hours.
-- An append-only delivery-attempt history and a separate DLQ.
+- A separate single-worker process, 2-second polling, and oldest-first processing. Batch size and in-progress recovery policy remain undecided.
+- HMAC-SHA256 request signing, HTTPS destinations, a 10-second HTTP timeout, and rejection (without truncation) of payloads above 64 KB. Secret-at-rest and additional destination/network protections require review.
+- The agreed retry-delay sequence of 1 minute, 5 minutes, 30 minutes, 2 hours, and 12 hours. The total send count and DLQ threshold remain undecided.
+- Delivery history for the latest 100 deliveries and a separate DLQ.
 - Authenticated configuration/history APIs and an `ADMIN`-only, auditable DLQ replay API.
 
 ### Excluded or Deferred
@@ -45,22 +44,19 @@ The sub-10-second customer experience is a product objective, not a hard deliver
 - **Exactly-once delivery:** explicitly not provided; consumers deduplicate using `X-Event-Id`. ([TRANSCRICAO.md, 09:24–09:26])
 - **Master encryption-key rotation procedure:** endpoint secret rotation is included; rotation of the application encryption key and re-encryption of stored secrets are out of scope for this feature.
 
-### Confirmed FDD Clarifications
+### Proposed Implementation Details (Not Approved)
 
-The following implementation details were not fully specified by the source documents and were confirmed during preparation of this FDD. They are decisions for this feature, not claims that the meeting or current code had already defined them.
+The meeting and existing code do not decide the details below. They are provisional design proposals to make the FDD reviewable, not approved requirements or decisions. Confirm, revise, or remove each proposal before treating it as an implementation contract. Items that conflict with an unresolved meeting decision are listed as open and must not be implemented until clarified.
 
-| Topic | Confirmed decision |
+| Topic | Proposal for review |
 |---|---|
-| Retry count | One initial send plus five retries; six sends total per cycle. |
-| Order creation | Include `order.created` for active endpoints subscribed to `PENDING`. |
 | CRUD route family | Use `/customers/:customerId/webhooks`; history and replay retain the paths already specified in the PRD/transcript. |
-| Secret rotation | New secret signs immediately; the customer accepts old and new secrets in parallel for 24 hours. |
+| Secret rotation | Have the sender use the new secret immediately while the customer accepts old and new secrets in parallel for 24 hours. |
 | Secret at rest | AES-256-GCM, with an external 32-byte master key; master-key rotation is out of scope. |
 | Secret generation | Generate 32 cryptographically random bytes and return Base64url without padding once. |
 | HMAC header | `X-Signature: sha256=<lowercase-hex-digest>` over the exact UTF-8 request-body bytes. |
-| Worker batch | At most 10 records per polling batch. |
-| Processing recovery | 30-second lease; expired processing records become eligible again. |
-| Payload maximum | 65,536 UTF-8 bytes; oversized payloads are not sent or truncated and go directly to the DLQ. |
+| Processing recovery | Use a lease for in-progress work; its duration and recovery behavior require approval. |
+| Payload maximum | Interpret 64 KB as 65,536 UTF-8 bytes; oversized payloads are rejected rather than truncated, but their persistence/retry disposition requires approval. |
 | Delivery history | One immutable record per HTTP attempt; the API returns the latest 100 attempts. |
 | Response capture | Store HTTP status and at most 65,536 UTF-8 bytes of response body, with a truncation indicator. |
 | Endpoint deletion | Soft-delete; retain URL and encrypted secret while outbox or replayable DLQ records need them. |
@@ -70,18 +66,24 @@ The following implementation details were not fully specified by the source docu
 | New endpoint default | Active by default. |
 | Configuration list | Reuse existing `page`/`pageSize` pagination: defaults 1/20, maximum page size 100. |
 | DLQ replay | One replay per DLQ record; reset the retry count, retain attempt history and event UUID, and persist the administrator and replay time. A later exhausted cycle creates a new DLQ record. |
-| Outbound destination security | Require HTTPS, reject private/loopback/link-local/reserved IP destinations after DNS resolution, pin the validated destination for the connection, and do not follow redirects. |
+| Outbound destination security | In addition to HTTPS, reject private/loopback/link-local/reserved IP destinations after DNS resolution, pin the validated destination for the connection, and do not follow redirects. |
 | Encryption configuration | `WEBHOOK_ENCRYPTION_KEY` is Base64 for exactly 32 bytes and is required by both API and worker processes. |
 | Replay response | `202 Accepted` with the original event ID and `PENDING` state. A missing or already replayed DLQ record returns 404. |
 | Worker failure codes | Persist `WEBHOOK_DELIVERY_TIMEOUT`, `WEBHOOK_CONNECTION_FAILED`, `WEBHOOK_HTTP_NON_2XX`, and `WEBHOOK_PAYLOAD_TOO_LARGE` as internal attempt/DLQ reason codes. |
 
 ### Still Open
 
+- Whether a distinct `order.created` event is in scope. Until confirmed, the baseline includes only order status-change events.
+- Whether the initial send is included in “five attempts,” and consequently the total number of sends and the DLQ threshold.
+- Worker batch size, processing lease duration, and recovery behavior for a worker crash.
+- Which secret signs outbound requests during the 24-hour rotation overlap.
+- Secret-at-rest design, encryption-key provisioning and rotation, and the required outbound destination/network policy.
+- Whether oversized payloads are terminally rejected, retried, or moved directly to the DLQ.
+- Approval of the provisional persistence, deletion, history-capture, replay, and API response details above.
 - Retention and archival for delivered outbox rows, attempt history, and resolved DLQ records. No duration is specified.
 - Whether/when outbound rate limiting is needed.
 - A production tracing backend and metrics exporter. The current repository does not show an observability backend.
 - Future multiple-worker strategy and any ordering guarantee beyond the single-worker initial design.
-- Operational procedure for master-key rotation.
 - Per-customer authorization. The current approved behavior allows any authenticated `ADMIN` or `OPERATOR` to manage any customer ID; this is a documented residual risk, not a guarantee of tenant isolation.
 
 ## 4. Architecture and Component Overview
@@ -96,7 +98,7 @@ The codebase does not yet contain webhook implementation files. The following ar
 | `src/worker.ts` | Separate process entry point. Creates its own Prisma client using the same environment/database configuration, starts the webhook worker, and handles shutdown. The meeting proposed this path. |
 | `WebhookService` | Validates and manages endpoint configurations; coordinates secret creation/rotation; provides history and replay operations. |
 | `WebhookRepository` | Encapsulates endpoint, outbox, attempt, and DLQ persistence, including operations that receive a transaction client. |
-| `publishWebhookEvent(tx, order, fromStatus, toStatus)` (proposed helper) | Reads eligible endpoint configurations and inserts immutable event snapshots using the order transaction client. It performs no network I/O. The meeting proposed this shape for status changes; use the same transaction-bound approach for order creation. |
+| `publishWebhookEvent(tx, order, fromStatus, toStatus)` (proposed helper) | Reads eligible endpoint configurations and inserts immutable event snapshots using the order transaction client. It performs no network I/O. The meeting proposed this shape for status changes. |
 | Worker processor | Claims due outbox rows, records attempts, sends signed HTTPS requests, schedules retries, and transfers exhausted/oversized events to the DLQ. |
 | Existing centralized middleware | Authenticates API callers, validates request schemas, and formats `AppError`, Zod, Prisma, and unexpected errors. |
 | MySQL via Prisma | Stores endpoint configuration, outbox records, attempt history, DLQ records, and replay attribution. No new queue service is introduced. |
@@ -127,20 +129,13 @@ The request body is the persisted event snapshot, serialized once when the sourc
 }
 ```
 
-For `order.created`, `event_type` is `order.created`, `from_status` is `null`, and `to_status` is `PENDING`. Order items are excluded. The body timestamp describes the source event; `X-Timestamp` describes the individual delivery attempt.
+Order items are excluded. The body timestamp describes the source event; `X-Timestamp` describes the individual delivery attempt. Whether order creation emits a separate event is unresolved and is not included in the baseline contract.
 
 ## 5. Detailed Flows
 
-### 5.1 Order Creation and Transactional Outbox
+### 5.1 Order Creation Event Scope
 
-1. The authenticated order API validates the creation request through the existing Zod validation middleware.
-2. `OrderService.create` starts its existing Prisma transaction and validates the customer/products, computes totals, reserves the order number, creates the order, and writes its initial `PENDING` status history.
-3. Before returning from that transaction callback, the webhook enqueue helper loads active, non-deleted endpoints for the order's customer. It selects only endpoints whose `statuses` include `PENDING`.
-4. For each match, it generates a UUID, creates the `order.created` payload with `from_status: null`, `to_status: PENDING`, and the order's persisted values, serializes the payload once, and inserts one `PENDING` outbox row for that endpoint.
-5. If no endpoint matches, no outbox row is written. If any outbox insert fails, the transaction rejects and rolls back order, status history, inventory/sequence work, and all outbox inserts in that transaction.
-6. After commit, the API returns the created order using the existing `201` response convention. It does not wait for webhook delivery.
-
-The `order.created` behavior is included from PRD F02/F02 acceptance criteria and was explicitly confirmed for this FDD; it is not unambiguously stated in the meeting. Order transaction shape is verified in `src/modules/orders/order.service.ts`.
+The meeting explicitly covers notifications when an order status changes, but does not clearly decide whether creating an order should emit a distinct `order.created` event. The baseline FDD therefore does not enqueue a webhook from `OrderService.create`. Add that behavior only after the product scope is confirmed and the event's filter semantics are specified.
 
 ### 5.2 Status Change and Transactional Outbox
 
@@ -156,10 +151,10 @@ The existing transaction, stock handling, status history, and `changeStatus` met
 
 ### 5.3 Worker Poll, Claim, Delivery, and Attempt Recording
 
-1. The independent worker starts with a distinct Prisma client and the same `DATABASE_URL` and `WEBHOOK_ENCRYPTION_KEY` as the API process.
-2. Every two seconds, it queries at most 10 eligible rows ordered oldest-first. Eligible rows are `PENDING`, retryable `FAILED` rows whose `nextAttemptAt <= now`, and `PROCESSING` rows whose 30-second lease has expired. Claiming a row changes its state to `PROCESSING` and records `lockedAt`.
+1. The independent worker starts with its own Prisma client and the same database configuration as the API process.
+2. Every two seconds, it queries a small batch of eligible rows ordered oldest-first. The meeting does not specify the batch size or the in-progress recovery/lease mechanism; those details require approval.
 3. It creates an attempt-history row with the cycle/attempt numbers and start time before making the request. The worker resolves the endpoint's current URL and secret; a soft-deleted endpoint remains available while its existing outbox/DLQ work is replayable.
-4. The worker decrypts the secret with AES-256-GCM and serializes no new body: it sends the exact persisted UTF-8 payload bytes. If the body is greater than 65,536 bytes, it does not send or truncate it; it records `WEBHOOK_PAYLOAD_TOO_LARGE` and transfers the event directly to the DLQ without HTTP retries.
+4. The worker retrieves the endpoint secret and sends the persisted event snapshot. The meeting requires rejecting rather than truncating a payload above 64 KB, but does not specify how that rejection is persisted or whether it enters the DLQ; settle the exact byte limit and disposition before implementation.
 5. For an eligible payload, the worker computes HMAC-SHA256 over the exact body bytes and sends a POST over HTTPS. It includes:
    - `Content-Type: application/json`
    - `X-Event-Id: <stable event UUID>`
@@ -167,28 +162,27 @@ The existing transaction, stock handling, status history, and `changeStatus` met
    - `X-Timestamp: <current delivery-attempt timestamp in ISO 8601>`
    - `X-Signature: sha256=<lowercase hexadecimal HMAC>`
 6. The HTTP request has a 10-second timeout. Any 2xx is success. A 3xx, 4xx, 5xx, connection failure, or timeout is a failed attempt. Redirects are not followed.
-7. The worker updates the attempt record with status, response body (up to 65,536 UTF-8 bytes), truncation flag, response time, and failure code where applicable. It never writes request secrets or HMAC keys to logs or history.
+7. The worker records the delivery outcome, response, and response time needed by the delivery-history API. Exact response-body storage limits and whether attempts are individual immutable records are proposed persistence details, not meeting decisions.
 8. A 2xx response changes the outbox row to `DELIVERED`, records completion time, clears its processing lease, and retains the attempt record.
 9. A worker crash or persistence failure must not mark an event delivered without a persisted 2xx outcome. Once a processing lease expires, the row can be attempted again. If the remote endpoint received the previous request but the OMS did not persist its result, the repeated request is a permitted duplicate; the stable event ID lets the customer deduplicate.
 
-The two-second interval, separate process, oldest-first processing, 10-second timeout, headers, payload, 64 KiB limit, and at-least-once guarantee come from the meeting/PRD, with the batch size, lease, exact signature encoding, and oversized-payload disposition confirmed for this FDD.
+The two-second interval, separate process, oldest-first processing, 10-second timeout, headers, payload, 64 KB limit, and at-least-once guarantee come from the meeting/PRD. The batch size, recovery mechanism, exact signature encoding, exact byte conversion, and oversized-payload disposition remain undecided or are provisional proposals in Section 3.
 
 ### 5.4 Retry Scheduling and DLQ Transfer
 
-Each delivery cycle consists of an initial send and at most five retries:
+The meeting specifies five attempts and five delay values but does not establish how the values map to sends when the initial send is counted. The retry-count interpretation and DLQ threshold are therefore an implementation blocker. The sequence of agreed delay values is:
 
-| Send number | Meaning | Delay after preceding failed send |
-|---:|---|---:|
-| 1 | Initial send | None |
-| 2 | Retry 1 | 1 minute |
-| 3 | Retry 2 | 5 minutes |
-| 4 | Retry 3 | 30 minutes |
-| 5 | Retry 4 | 2 hours |
-| 6 | Retry 5 | 12 hours |
+| Sequence position | Delay |
+|---:|---:|
+| 1 | 1 minute |
+| 2 | 5 minutes |
+| 3 | 30 minutes |
+| 4 | 2 hours |
+| 5 | 12 hours |
 
-For a timeout, connection failure, or non-2xx response, the worker persists the failed attempt and sets the outbox state to `FAILED` with the calculated `nextAttemptAt`. The worker claims it again only when due. Delay is measured from the preceding failed attempt. On failure of send number 6, the worker atomically persists the final attempt, inserts a separate DLQ record with event ID, endpoint ID, immutable payload, failure reason, and timestamp, and leaves the outbox row in terminal `FAILED` state. A DLQ persistence failure must not mark the event delivered or silently discard it; the final failed row remains eligible for DLQ-transfer recovery.
+For a timeout, connection failure, or non-2xx response, record a failed attempt and apply the delay corresponding to the approved retry interpretation. Once the approved attempt limit is exhausted, persist the event, failure reason, and timestamp in the separate DLQ. The exact threshold and persistence recovery mechanism must be selected before implementation.
 
-The retry schedule and separate DLQ are from [TRANSCRICAO.md, 09:14–09:19, 09:48] and ADR-003. The initial-send-plus-five-retries interpretation was confirmed for this FDD because the meeting's “five attempts” summary and PRD wording differed.
+The retry schedule and separate DLQ are from [TRANSCRICAO.md, 09:14–09:19, 09:48] and ADR-003. The transcript's wording is internally ambiguous; this FDD does not silently choose an interpretation.
 
 ### 5.5 Administrative DLQ Replay
 
@@ -199,9 +193,11 @@ The retry schedule and separate DLQ are from [TRANSCRICAO.md, 09:14–09:19, 09:
 5. A second replay of the same DLQ record is not allowed. The attempt history is preserved; if the replay cycle exhausts its retries, a new DLQ record is created for that cycle.
 6. If replay persistence fails, neither the outbox reset nor the DLQ audit update commits, and the API does not return success.
 
-The `/admin/webhooks/dead-letter/:id/replay` path, `ADMIN` requirement, and attribution requirement are from [TRANSCRICAO.md, 09:18–09:19, 09:35–09:36] and PRD F05. The one-replay-per-DLQ lifecycle and `202` result were confirmed for this FDD.
+The `/admin/webhooks/dead-letter/:id/replay` path, `ADMIN` requirement, and attribution requirement are from [TRANSCRICAO.md, 09:18–09:19, 09:35–09:36] and PRD F05. One-replay-per-record and `202 Accepted` are provisional contract proposals, not meeting decisions.
 
 ## 6. Public Contracts
+
+The request/response shapes, CRUD paths not explicitly named in the meeting, status codes, and persistence semantics below are implementation proposals for review. The meeting-backed requirements are authenticated endpoint CRUD, customer ID supplied in the request, HTTPS, a one-time generated secret, delivery history, and administrator replay. Do not treat unresolved proposals as approved contracts.
 
 All routes below are mounted below the existing `/api/v1` prefix, use JSON, and use the existing Bearer JWT authentication. Configuration, rotation, and delivery-history routes accept either existing authenticated role (`ADMIN` or `OPERATOR`); they do not enforce a user-to-customer relationship in this release. Replay requires `ADMIN`. `customerId`, `webhookId`, and DLQ IDs are UUIDs.
 
@@ -236,7 +232,7 @@ Response `201 Created` (the `secret` is returned once only):
 }
 ```
 
-**Validation/semantics:** URL must be HTTPS and pass outbound destination checks. `statuses` must contain one or more unique values from `PENDING`, `PAID`, `PROCESSING`, `SHIPPED`, `DELIVERED`, `CANCELLED`. The endpoint is active on creation. The system generates a unique 32-byte secret, persists only its AES-256-GCM ciphertext/nonce/tag, and returns the plaintext once. There is no agreed endpoint-count limit.
+**Validation/semantics:** URL must be HTTPS. `statuses` must contain one or more unique values from the supported status-change targets `PAID`, `PROCESSING`, `SHIPPED`, `DELIVERED`, and `CANCELLED`. `PENDING` is an initial state, not a valid status-change target in `src/modules/orders/order.status.ts`; accept it only if the open `order.created` event is approved. The endpoint is active on creation. Secret length, encoding, and at-rest protection follow the provisional proposals in Section 3. There is no agreed endpoint-count limit.
 
 **Status codes:** `201`; `400` with `WEBHOOK_INVALID_URL` for a non-HTTPS/invalid destination; `400 VALIDATION_ERROR` for malformed body/UUID/status list; `401 UNAUTHORIZED`; persistence and unexpected errors use the existing centralized error handling.
 
@@ -314,7 +310,7 @@ Response `200 OK`:
 }
 ```
 
-**Validation/semantics:** The body is a non-empty partial object containing only `url`, `statuses`, or `active`. If supplied, URL and statuses use the create validation rules; status arrays cannot be empty or contain duplicates. The secret is not returned. Pending attempts use the updated URL/secret, while their payload remains the original snapshot.
+**Validation/semantics:** The body is a non-empty partial object containing only `url`, `statuses`, or `active`. If supplied, URL and statuses use the create validation rules; status arrays cannot be empty or contain duplicates. The secret is not returned. Whether pending attempts use current or enqueue-time endpoint configuration remains a proposal requiring review; the payload remains the original snapshot.
 
 **Status codes:** `200`; `400 WEBHOOK_INVALID_URL` or `400 VALIDATION_ERROR`; `404 WEBHOOK_NOT_FOUND`; `401 UNAUTHORIZED`.
 
@@ -362,7 +358,7 @@ Response `200 OK` (new secret returned once):
 }
 ```
 
-The new secret signs requests immediately. The client must accept both secrets for the 24-hour overlap; only the new secret is returned by this response. List, read, and update responses never expose a secret.
+The signing-secret selection during the overlap remains open. This example proposes returning the new secret once; list, read, and update responses do not expose a secret.
 
 **Status codes:** `200`; `404 WEBHOOK_NOT_FOUND`; `401 UNAUTHORIZED`.
 
@@ -490,13 +486,13 @@ One row represents one event delivered to one endpoint. Its UUID is the stable `
 | `eventId` | UUID, primary key | Stable event ID and `X-Event-Id`. |
 | `webhookId` | UUID, FK to endpoint | Delivery destination configuration. |
 | `orderId` | UUID value, not cascading FK | Source order identifier; payload remains useful even if order deletion occurs later. |
-| `eventType` | VarChar/string, required | `order.created` or `order.status_changed`. |
+| `eventType` | VarChar/string, required | `order.status_changed` in the baseline. Add `order.created` only if scope is approved. |
 | `payload` | Text, required, immutable | Exact serialized JSON body signed and sent on every attempt. |
 | `status` | Enum: `PENDING`, `PROCESSING`, `FAILED`, `DELIVERED` | Delivery lifecycle. |
-| `attemptsMade` | Integer, default `0` | Number of HTTP sends in the current cycle; initial send is 1 once started, maximum 6 per cycle. |
+| `attemptsMade` | Integer, default `0` | Number of HTTP sends in the current cycle; the maximum is blocked on the retry-count decision. |
 | `cycle` | Integer, default `1` | Increments on administrative replay; event UUID is unchanged. |
 | `nextAttemptAt` | Nullable DateTime | Retry due time; set after a failed send. |
-| `lockedAt` | Nullable DateTime | Start of the 30-second processing lease. |
+| `lockedAt` | Nullable DateTime | Start time for the approved in-progress recovery mechanism, if a lease is selected. |
 | `lastFailureCode` | Nullable string | Most recent internal reason code. |
 | `createdAt`, `updatedAt` | DateTime | Source enqueue and lifecycle timestamps. |
 | `deliveredAt` | Nullable DateTime | Successful delivery timestamp. |
@@ -511,7 +507,7 @@ One row records each individual HTTP attempt; attempt rows are retained across r
 |---|---|---|
 | `id` | UUID, primary key | Attempt record identifier. |
 | `eventId` | UUID, FK to outbox | Stable event reference. |
-| `cycle`, `attempt` | Integers, required | Retry cycle and send number (1–6). |
+| `cycle`, `attempt` | Integers, required | Retry cycle and send ordinal; the maximum is not set until the attempt-count decision is resolved. |
 | `outcome` | Enum/string: `IN_PROGRESS`, `SUCCEEDED`, `FAILED` | Attempt lifecycle. |
 | `startedAt`, `completedAt` | DateTime | Start/end timestamps. |
 | `durationMs` | Nullable integer | HTTP attempt duration. |
@@ -524,7 +520,7 @@ Recommended uniqueness constraint: `(eventId, cycle, attempt)`. Recommended inde
 
 ### 7.4 `WebhookDeadLetter` (proposed table: `webhook_dead_letter`)
 
-One row is created when a retry cycle is exhausted or an oversized payload is rejected. Each record is replayable once.
+One row is created when a retry cycle is exhausted under the approved threshold. Whether an oversized payload enters the DLQ is undecided. Each record's replay lifecycle is a proposal for review.
 
 | Field | Type/constraint | Purpose |
 |---|---|---|
@@ -562,10 +558,10 @@ The API error envelope and generic codes follow `src/shared/errors/app-error.ts`
 | Invalid body/query/UUID/status enum | Existing `VALIDATION_ERROR` | Existing Zod validation rejects input. | API returns 400 with the shared validation envelope. | Correct request fields. |
 | Missing/invalid JWT | Existing `UNAUTHORIZED` | Request lacks an accepted Bearer token. | API returns 401. | Authenticate and retry. |
 | Non-ADMIN attempts replay | Existing `FORBIDDEN` | Authenticated caller lacks `ADMIN`. | API returns 403; no replay is recorded. | An administrator must perform the action. |
-| Destination times out | `WEBHOOK_DELIVERY_TIMEOUT` | No response within 10 seconds. | Attempt is failed; `nextAttemptAt` follows the retry schedule. | Retry; after the fifth retry, move to DLQ. |
+| Destination times out | `WEBHOOK_DELIVERY_TIMEOUT` | No response within 10 seconds. | Attempt is failed; `nextAttemptAt` follows the retry schedule. | Retry; move to DLQ after the approved attempt limit is exhausted. |
 | DNS/connect/TLS connection fails | `WEBHOOK_CONNECTION_FAILED` | HTTPS request cannot establish a valid connection. | Attempt is failed; no success is reported. | Retry under the same schedule; eventual DLQ. |
 | Destination returns 3xx/4xx/5xx | `WEBHOOK_HTTP_NON_2XX` | Response is not 2xx; redirects are not followed. | Record status/body and schedule retry. | Retry; eventual DLQ. |
-| Serialized event body exceeds 65,536 UTF-8 bytes | `WEBHOOK_PAYLOAD_TOO_LARGE` | Size is checked before sending. | Do not send or truncate; record in DLQ immediately, without HTTP retry. | Investigate payload design; replay does not reduce its size. |
+| Serialized event body exceeds the approved 64 KB byte limit | `WEBHOOK_PAYLOAD_TOO_LARGE` | Size is checked before sending. | Reject without sending or truncating; persistence and retry/DLQ handling require an approved decision. | Investigate the payload; do not claim replay or automatic recovery. |
 | Source transaction's outbox insert fails | No new public feature code specified | Prisma persistence error inside order transaction. | Transaction rejects; the source order operation and event writes roll back; existing error middleware formats the API response. | Retry the order operation after the underlying persistence issue is resolved. |
 | Worker cannot persist attempt/result/DLQ | Operational persistence error; no feature HTTP code | Database operation fails. | Log explicitly; never mark delivered; leave the row recoverable through state/lease/DLQ-transfer recovery. | Worker retries persistence/recovery; alert operations. |
 | Replay transaction fails | Existing centralized persistence/error handling | Outbox reset or audit update cannot commit. | Roll back both updates; do not return 202. | Retry only after persistence recovery. |
@@ -576,13 +572,15 @@ The API error envelope and generic codes follow `src/shared/errors/app-error.ts`
 
 - MySQL transactional outbox avoids a distributed transaction between the OMS and customer.
 - One single worker polls oldest-first; there is no global ordering promise. Per-order ordering is expected only under this single-worker design.
-- The 30-second lease exceeds the 10-second HTTP timeout. An expired `PROCESSING` record may be retried after worker restart or crash.
+- A worker crash can leave a record in progress. The recovery mechanism and its timing must be selected before implementation.
 - A timeout or crash after a remote receiver accepted the request but before the OMS recorded success can cause a duplicate. Preserve the same event UUID and document customer-side deduplication.
-- Retry schedule: initial request plus five retries, delays measured after each preceding failed send: 1m, 5m, 30m, 2h, 12h. After the final failure, persist to the separate DLQ.
-- Oversized payloads are terminal for the current delivery and go directly to DLQ; retrying the unchanged payload cannot make it smaller.
+- Retry delay values are 1m, 5m, 30m, 2h, and 12h. The transcript does not settle whether the initial request is included in “five attempts”; agree on the attempt count and DLQ threshold before implementing this policy.
+- Oversized payloads must be rejected rather than truncated. Whether they are retried, held for investigation, or moved directly to the DLQ remains undecided.
 - Outbound rate limiting and archival are not included. Pending growth and database usage must be observed.
 
 ### Request Authentication and Secret Handling
+
+The HMAC, per-endpoint secret, 24-hour overlap, and HTTPS requirements are from the meeting. Encryption-at-rest details, which key signs during rotation, and network destination restrictions are provisional proposals that require security review.
 
 - Use HMAC-SHA256 over the exact UTF-8 bytes sent in the request body. Send `X-Signature: sha256=<lowercase hex>`.
 - Use one independently generated 32-byte secret per endpoint. Return it once on creation/rotation; never expose it in list, update, error, log, or history responses.
@@ -617,10 +615,10 @@ Never log the plaintext secret, master key, HMAC value, Authorization header, fu
 | `webhook_outbox_pending` | Current count of due/pending/processing records and age of oldest due record. |
 | `webhook_delivery_attempts_total` | Attempts grouped by success/failure code and endpoint outcome. Avoid unbounded customer identifiers as metric labels. |
 | `webhook_delivery_duration_seconds` | Time spent in outbound HTTP attempts. |
-| `webhook_first_success_latency_seconds` | Source event creation to first successful 2xx, for the PRD's 95%/10-second target. |
+| `webhook_first_success_latency_seconds` | Source event creation to first successful 2xx; report the share meeting the under-10-second expectation without an invented percentage threshold. |
 | `webhook_dlq_records_total` | DLQ entries grouped by failure code. |
 | `webhook_worker_poll_lag_seconds` | Time since the last successful poll / age of oldest eligible event. |
-| `webhook_payload_rejected_total` | Payloads sent directly to DLQ for exceeding 64 KiB. |
+| `webhook_payload_rejected_total` | Payloads rejected for exceeding the approved 64 KB limit; disposition is tracked separately. |
 
 Metrics names and the backend/exporter are proposals; the current code does not establish a metrics convention or dependency.
 
@@ -634,7 +632,7 @@ The following existing paths were verified in the repository. New webhook paths 
 
 | Existing file | Verified behavior | Webhook integration |
 |---|---|---|
-| [`src/modules/orders/order.service.ts`](../src/modules/orders/order.service.ts) | `create` and `changeStatus` use Prisma interactive transactions; `changeStatus` updates stock, order status, and history. | Call the transaction-bound enqueue helper in `create` for `order.created` and in `changeStatus` for `order.status_changed`. Pass the current transaction client; do not make HTTP calls here. Any eligible outbox insert failure must abort the transaction. |
+| [`src/modules/orders/order.service.ts`](../src/modules/orders/order.service.ts) | `create` and `changeStatus` use Prisma interactive transactions; `changeStatus` updates stock, order status, and history. | Call the transaction-bound enqueue helper in `changeStatus` for `order.status_changed`. Pass the current transaction client; do not make HTTP calls here. Any eligible outbox insert failure must abort the transaction. Do not enqueue on `create` unless order-creation notifications are approved. |
 | [`src/modules/orders/order.status.ts`](../src/modules/orders/order.status.ts) | Defines valid `OrderStatus` transitions and the stock debit/replenishment rules. | Use the resulting persisted status as the subscription filter for status-change events. Do not duplicate or alter the state machine in the webhook module. |
 | [`prisma/schema.prisma`](../prisma/schema.prisma) | Defines MySQL models, UUID `CHAR(36)` identifiers, `OrderStatus`, `UserRole`, and customer/order relations. | Add the proposed endpoint/outbox/attempt/DLQ Prisma models and indexes in a future implementation. Store status subscriptions as JSON, matching the existing use of a JSON field for customer address; no webhook models currently exist. |
 | [`src/routes/index.ts`](../src/routes/index.ts) | Composes domain routers under their resource prefixes. | Add a webhook router and controller dependency to the API router composition. Preserve the customer-scoped CRUD paths and separate admin replay path. |
@@ -656,15 +654,15 @@ The following existing paths were verified in the repository. New webhook paths 
 - Existing `OrderService` transaction and order status enum.
 - Existing Prisma client, MySQL database, `DATABASE_URL`, and schema migration workflow.
 - Existing Express router/controller/service/repository patterns, Zod middleware, authentication, `requireRole`, shared errors, pagination helper, and Pino logger.
-- Existing Node.js `>=20` runtime. Use built-in `node:crypto` for random secret generation, AES-256-GCM, and HMAC-SHA256. Use a built-in HTTPS client with a validated/pinned DNS lookup to enforce the destination policy.
+- Existing Node.js `>=20` runtime. Built-in `node:crypto` can provide random secret generation and HMAC-SHA256. Encryption and destination/network controls depend on the security design approved during review.
 
 ### Deployment and Configuration Impact
 
 - Apply the new Prisma migration before starting code that reads the webhook models.
-- Configure the same `WEBHOOK_ENCRYPTION_KEY` (Base64 for 32 bytes) for API and worker processes before enabling webhook creation/delivery.
+- Configure the key material required by the approved secret-at-rest design for both API and worker processes before enabling webhook delivery.
 - Deploy/start the API and worker as separate processes. The worker requires database connectivity and the same encryption-key configuration.
 - Add a worker build/start script without replacing the existing API `start` script.
-- No Redis, queue service, mail service, dashboard, new HTTP library, or metrics/tracing backend is approved by the source documents or this FDD.
+- No Redis, queue service, mail service, or dashboard is included in the meeting-approved scope. Any new HTTP, encryption, metrics, or tracing dependencies require design review.
 
 ### Compatibility
 
@@ -675,10 +673,10 @@ The following existing paths were verified in the repository. New webhook paths 
 
 ## 13. Technical Acceptance Criteria
 
+The acceptance criteria below distinguish transcript-backed behavior from proposed implementation details. Details listed as not approved or still open in Section 3 are not binding acceptance criteria until the review resolves and records them.
+
 ### Event Capture and Transactions
 
-- Creating an order with an active endpoint subscribed to `PENDING` commits one `order.created` outbox record per eligible endpoint with `from_status: null`.
-- Creating an order with no matching active endpoint creates no webhook outbox row.
 - Changing status writes one `order.status_changed` snapshot only for active endpoints subscribed to the new status.
 - Inactive, deleted, or unsubscribed endpoints receive no new outbox row.
 - An outbox insert failure rolls back the order, status history, and inventory changes in the same transaction.
@@ -688,21 +686,21 @@ The following existing paths were verified in the repository. New webhook paths 
 ### API and Security
 
 - API contracts exist for create, list, patch, delete, secret rotation, history, and admin replay at the paths and methods in Section 6.
-- URL validation rejects non-HTTPS and resolved prohibited destinations; redirects are not followed.
+- URL validation rejects non-HTTPS destinations. The additional network-destination restrictions in the proposal require security review.
 - Creation returns a generated secret once; list/update/history never return it.
-- Secret rotation returns a different secret, signs immediately with it, and exposes the 24-hour customer overlap deadline.
+- Secret rotation supports the agreed 24-hour overlap. Which secret signs requests during that period must be approved.
 - HMAC is over the exact transmitted UTF-8 request bytes and matches `sha256=<lowercase hex>`.
 - The request includes all required headers and a stable event ID across retries and replay.
-- The worker/API reject missing or malformed `WEBHOOK_ENCRYPTION_KEY` during bootstrap.
+- Secret encryption and key configuration must follow the approved at-rest protection design.
 - Configuration/history routes require authentication; replay rejects non-admin users and records the acting admin.
 
 ### Worker, Retry, and DLQ
 
-- Worker is a separate process with its own Prisma client, polls every two seconds, claims at most 10 rows per batch, and orders them oldest-first.
-- Processing leases expire after 30 seconds; expired work becomes eligible for reprocessing.
+- Worker is a separate process with its own Prisma client, polls every two seconds, and processes older pending rows first. The batch size remains open.
+- The worker recovers in-progress work after a crash using a mechanism and duration approved before implementation.
 - Requests have a 10-second timeout. 2xx responses become `DELIVERED`; timeout, connection failure, and every non-2xx response are recorded as failures.
-- Retry delays after each failed attempt are exactly 1m, 5m, 30m, 2h, and 12h, yielding one initial send plus five retries.
-- Failure of the sixth send creates a separate DLQ record; an event larger than 65,536 UTF-8 bytes is sent directly to DLQ without a request.
+- Use the agreed retry-delay sequence of 1m, 5m, 30m, 2h, and 12h. Resolve the meaning of “five attempts” before defining the final attempt or DLQ threshold.
+- Exhausted deliveries create a separate DLQ record after the attempt limit is approved. Payloads above 64 KB are rejected rather than truncated; their persistence/retry disposition and exact byte limit require approval.
 - Every HTTP attempt has a history record, including status/outcome, duration, captured response body, truncation flag, and failure code.
 - A worker/database failure cannot produce a success-shaped state or silently discard a record.
 - Replay is one-time per DLQ record, requires `ADMIN`, retains event ID/payload, resets the retry count for a new cycle, and records `replayedByUserId`/`replayedAt`.
@@ -719,12 +717,12 @@ The following existing paths were verified in the repository. New webhook paths 
 
 | Risk | Evidence/impact | Mitigation or status |
 |---|---|---|
-| Customer outage or latency delays notifications and can exhaust retries. | The meeting explicitly considered unavailable/slow endpoints; PRD success target is under 10 seconds for 95% first successes. | 10-second timeout, five scheduled retries, attempt history, and DLQ replay. Delivery after exhaustion is not guaranteed. |
+| Customer outage or latency delays notifications and can exhaust retries. | The meeting explicitly considered unavailable/slow endpoints; customers define under 10 seconds as real time. | 10-second timeout, the agreed retry-delay sequence, attempt history, and DLQ replay. Attempt count and DLQ threshold remain open. |
 | At-least-once behavior can produce duplicate requests. | A remote endpoint may accept a request while the OMS loses the response or crashes before persisting success. | Stable `X-Event-Id` across retry/replay; customer deduplication is required. |
 | One worker and ordered batch processing can create backlog behind slow endpoints. | Initial deployment deliberately uses one worker; multi-worker scaling is deferred. | Monitor pending age/worker lag; observe before deciding on concurrency/rate limiting or scaling. No global ordering guarantee. |
 | Any authenticated operator can manage any customer's webhook. | This is explicitly the approved F01 behavior, but current JWT roles do not encode customer ownership. | Document as residual risk; a future per-customer authorization decision is required to provide tenant isolation. |
 | Outbound webhook URL could target internal services. | Endpoint URLs are supplied through the API and are fetched by an OMS process. | HTTPS only; resolve and reject prohibited IPv4/IPv6 ranges for each connection, pin the checked address, and do not follow redirects. |
 | Endpoint secret or encryption key exposure. | Secrets are used to sign order payloads; the current logger redacts common auth/password/token fields but has no webhook-specific fields. | Per-endpoint 32-byte secrets, AES-256-GCM at rest, external master key, one-time secret response, no secret/payload logging, security review before deployment. Master-key rotation remains out of scope. |
 | Database growth from outbox, attempt, and DLQ evidence. | Archival/retention was explicitly deferred; per-attempt history increases row volume. | Track row counts and oldest-record age; retention/archival is an unresolved operational policy. |
-| Payload above 64 KiB cannot be delivered by this contract. | Payload ceiling and reject-not-truncate behavior were agreed; current disposition is direct DLQ. | Record `WEBHOOK_PAYLOAD_TOO_LARGE`; investigate the snapshot schema. Replay does not solve an unchanged oversized payload. |
-| The 95%/10-second target may be missed during backlog or slow endpoint behavior. | A poll interval and HTTP timeout alone do not ensure end-to-end latency. | Measure first-success latency and worker lag; treat the metric as an objective, not an unconditional guarantee. |
+| Payload above 64 KB cannot be delivered by this contract. | The meeting agreed to reject rather than truncate oversized payloads; exact byte conversion and subsequent disposition are unresolved. | Do not send or truncate; approve and document persistence/retry handling before implementation. |
+| The under-10-second customer latency expectation may be missed during backlog or slow endpoint behavior. | A poll interval and HTTP timeout alone do not ensure end-to-end latency. | Measure first-success latency and worker lag; treat the expectation as an objective, not an unconditional guarantee. |

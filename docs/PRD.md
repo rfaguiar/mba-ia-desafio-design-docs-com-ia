@@ -28,7 +28,7 @@ The feature adds customer-scoped webhook configuration to the existing Node.js/T
 
 ### The Opportunity
 
-The feature replaces repeated polling with an asynchronous outbound notification path. A MySQL outbox written in the order transaction preserves consistency without adding a separate queueing infrastructure. A worker polls every two seconds, while the agreed first-attempt target is under 10 seconds for at least 95% of eligible events.
+The feature replaces repeated polling with an asynchronous outbound notification path. A MySQL outbox written in the order transaction preserves consistency without adding a separate queueing infrastructure. A worker polls every two seconds; customers define a delay under 10 seconds as real time. Measure actual delivery latency, but the meeting sets no percentage SLO.
 
 Per-endpoint status filters avoid creating deliveries that a customer did not request. HMAC-SHA256, HTTPS-only destinations, unique endpoint secrets, and secret rotation give customers a way to verify requests. A bounded retry schedule, separate DLQ, delivery history, and administrator replay make failures observable and recoverable without coupling customer availability to order processing.
 
@@ -45,7 +45,7 @@ Per-endpoint status filters avoid creating deliveries that a customer did not re
 
 | Risk | Probability | Impact | Mitigation |
 |---|---|---|---|
-| A customer endpoint is unavailable or slow, delaying notification and eventually moving an event to the DLQ. | Medium | High | Apply the 10-second timeout, five scheduled retries, persist exhausted events in the DLQ, and allow an administrator to replay them. |
+| A customer endpoint is unavailable or slow, delaying notification and eventually moving an event to the DLQ. | Medium | High | Apply the 10-second timeout and agreed retry-delay sequence, persist exhausted events in the DLQ, and allow an administrator to replay them. Resolve the attempt count before implementation. |
 | At-least-once delivery causes a customer to receive an event more than once. | Medium | Medium | Assign one UUID per event in `X-Event-Id`; document that consumers should deduplicate using that ID. A DLQ replay retains the original ID. |
 | A webhook secret is compromised. | Medium | High | Use a unique secret per endpoint, require HTTPS, support a 24-hour rotation overlap, and reserve two business days for security review before deployment. The at-rest protection mechanism remains an open technical decision. |
 | Any authenticated user can manage webhook records for any customer ID in this version. | Medium | High | Require authentication on all configuration and history routes, document this residual access-scope risk, and complete the planned security review before deployment. Per-customer authorization is not part of this version. |
@@ -83,9 +83,9 @@ Per-endpoint status filters avoid creating deliveries that a customer did not re
 
 | Objective | Metric | Measurement condition |
 |---|---|---|
-| Notify customers promptly | At least 95% of eligible events receive a successful 2xx response on the first attempt within 10 seconds of the source order event. | Measure daily from the source event timestamp to the first successful response; count the initial attempt only. |
-| Preserve transactional consistency | 100% of eligible events for committed order operations are persisted in the same transaction; no corresponding outbox entry remains for a rolled-back operation. | Verify order creation and status-transition commit/rollback cases with transaction-level integration tests. |
-| Recover failed deliveries | Every delivery that still fails after five retries is represented in the DLQ; the retry schedule is exactly 1 minute, 5 minutes, 30 minutes, 2 hours, and 12 hours after the preceding failed attempt. | Exercise timeout, connection failure, and non-2xx destination responses through the final retry and DLQ transition. |
+| Notify customers promptly | Target delivery latency is under 10 seconds, matching the customer-defined meaning of real time. | Measure source-event-to-first-success latency and the share of events meeting the target; the meeting sets no percentage SLO. |
+| Preserve transactional consistency | 100% of eligible status-change events for committed order operations are persisted in the same transaction; no corresponding outbox entry remains for a rolled-back operation. | Verify status-transition commit/rollback cases with transaction-level integration tests. Add order-creation cases only if that event is approved. |
+| Recover failed deliveries | Deliveries exhausted under the approved retry policy are represented in the DLQ; the agreed delay sequence is 1 minute, 5 minutes, 30 minutes, 2 hours, and 12 hours. The transcript does not resolve whether the initial send is included in “five attempts.” | Exercise timeout, connection failure, and non-2xx destination responses through the approved final attempt and DLQ transition after the attempt-count interpretation is resolved. |
 | Deliver the planned scope | Complete within the three-sprint estimate, reserving at least two business days for security review before deployment. | Compare the release plan and completed review against the agreed estimate; no calendar date is specified in the meeting. |
 
 ## 5. User Stories
@@ -98,7 +98,6 @@ Per-endpoint status filters avoid creating deliveries that a customer did not re
 
 ### F02. Transactional Order Event Capture
 - As the system, I want to write an eligible status-change event to the outbox in the same transaction as the order change so that committed changes cannot lose their notifications.
-- As the system, I want to record a `order.created` event for endpoints subscribed to `PENDING` so that customers can learn when a matching order is first created.
 - As the system, I want to store the event payload as a snapshot when it is enqueued so that later order changes do not alter the earlier event.
 
 ### F03. Asynchronous Signed Delivery and Retry
@@ -116,6 +115,23 @@ Per-endpoint status filters avoid creating deliveries that a customer did not re
 
 ## 6. Functionalities
 
+### Functional Requirements
+
+The following requirements are explicitly discussed in the meeting. Order-creation notifications are not included here because the meeting does not clearly decide whether a creation event is in scope.
+
+| ID | Requirement | Source |
+|---|---|---|
+| PRD-FR-01 | Authenticated users can create, list, update, and delete customer-scoped webhook configurations. | [09:31]–[09:33] Marcos, Bruno |
+| PRD-FR-02 | Each endpoint stores a list of order statuses to subscribe to, and filtering occurs before insertion into the outbox. | [09:33]–[09:34] Marcos, Bruno |
+| PRD-FR-03 | Eligible order status-change events are written to the MySQL outbox in the same transaction as the order change. | [09:06] Diego; [09:40]–[09:41] Bruno, Diego |
+| PRD-FR-04 | A separate worker polls the outbox every two seconds and processes older pending events first. | [09:09]–[09:12] Diego, Larissa |
+| PRD-FR-05 | Outbound requests use HMAC-SHA256 with a unique secret per endpoint, a 24-hour rotation overlap, and HTTPS destinations. | [09:20]–[09:23] Sofia |
+| PRD-FR-06 | The JSON payload contains the agreed order/event fields, excludes order items, and is rejected rather than truncated above 64 KB. | [09:23]–[09:24], [09:43] Diego, Larissa |
+| PRD-FR-07 | Failed deliveries use the agreed delay sequence and exhausted deliveries are persisted in a separate DLQ for manual replay; the attempt-count interpretation remains open. | [09:15]–[09:19] Diego, Bruno, Larissa |
+| PRD-FR-08 | Authenticated users can inspect the latest 100 delivery records, including outcome, payload, response, and response time. | [09:34] Marcos |
+| PRD-FR-09 | An administrator can replay a DLQ record through an admin endpoint; the replay action records the actor. | [09:18]–[09:19] Diego, Larissa; [09:36] Sofia |
+| PRD-FR-10 | Delivery is at-least-once, and customers deduplicate repeats using the stable `X-Event-Id`. | [09:24]–[09:26] Diego, Bruno, Larissa |
+
 ### F01. Webhook Endpoint Configuration
 
 **Provides:**
@@ -126,7 +142,7 @@ Per-endpoint status filters avoid creating deliveries that a customer did not re
 **Capabilities:**
 - Provide authenticated API operations to create, list, update, and delete webhook configurations. The `customer_id` is supplied in the route, not derived from the JWT.
 - Any authenticated user may manage configuration for any customer ID in this version; the current OMS roles are `ADMIN` and `OPERATOR`. No user-to-customer association or per-customer authorization is introduced.
-- A configuration contains a destination URL, active state, and a list of order statuses/events to receive. Available order statuses are `PENDING`, `PAID`, `PROCESSING`, `SHIPPED`, `DELIVERED`, and `CANCELLED`.
+- A configuration contains a destination URL, active state, and a list of order statuses to receive. The existing OMS statuses are `PENDING`, `PAID`, `PROCESSING`, `SHIPPED`, `DELIVERED`, and `CANCELLED`; the `PENDING` filter is meaningful only if the open `order.created` event is approved.
 - Accept HTTPS URLs only. Reject HTTP destinations with `WEBHOOK_INVALID_URL`.
 - Generate a unique secret for each endpoint. Return the secret once on creation; do not reveal it again through list or read operations.
 - Allow the authenticated user to request rotation. Return the new secret once in the rotation response and retain the prior secret for 24 hours. Which secret signs outbound requests during this overlap remains an open technical decision and is not specified here.
@@ -158,16 +174,15 @@ Per-endpoint status filters avoid creating deliveries that a customer did not re
 **Capabilities:**
 - For each eligible endpoint, write the event to the MySQL outbox in the same Prisma transaction as the source order operation.
 - For a status transition, enqueue only when the endpoint is active and subscribed to the new status. Include the event ID, event type `order.status_changed`, ISO 8601 timestamp, order ID, order number, `from_status`, `to_status`, customer ID, and `total_cents`. Do not include order items.
-- On order creation, enqueue the distinct event type `order.created` only for active endpoints subscribed to `PENDING`. Use the common event fields with `from_status: null` and `to_status: PENDING`.
 - Render and persist the payload snapshot at enqueue time. Later changes to the order do not change a previously enqueued payload.
 - If no active endpoint subscribes to the event, do not insert an outbox record for that endpoint.
 - An outbox insertion failure rolls back the source order operation, including the order/status history/inventory changes in that transaction. A rolled-back source operation leaves no event.
 
 **Experience:**
-- When an order is created or its status is changed, the system reads the applicable customer webhook configurations and filters by the relevant event/status.
+- When an order status changes, the system reads the applicable customer webhook configurations and filters by the new status.
 - It creates an immutable payload and writes one delivery record per matching endpoint in the same database transaction.
 - After commit, the worker can read the pending delivery. If the order transaction rolls back, the outbox write rolls back with it.
-- The customer receives an order-creation event only if it subscribed to `PENDING`; status transitions use the newly selected status for filtering.
+- Whether order creation emits a separate event remains open; this version only specifies eligible status-change events.
 
 **Error Handling:**
 - If the outbox write fails, the order transaction fails as a whole; the API does not report a successful order operation without its eligible event record.
@@ -190,7 +205,7 @@ Per-endpoint status filters avoid creating deliveries that a customer did not re
 - Include `Content-Type: application/json`, `X-Event-Id` (the event UUID), `X-Webhook-Id` (the endpoint ID), `X-Timestamp` (send timestamp), and `X-Signature` (HMAC-SHA256 over the request body).
 - Reject rather than truncate a payload larger than 64 KB. The detailed persistence/retry path for this exceptional payload-size failure is not further specified.
 - Set a 10-second HTTP timeout. Any 2xx response is successful. A timeout, connection failure, 3xx, 4xx, or 5xx response is a failed attempt and follows the retry schedule.
-- Make five retries after the initial send, at 1 minute, 5 minutes, 30 minutes, 2 hours, and 12 hours after the preceding failed attempt. After the fifth retry fails, persist the event in a separate DLQ table with its payload, failure reason, and timestamp.
+- Apply the agreed delay sequence of 1 minute, 5 minutes, 30 minutes, 2 hours, and 12 hours after failures. Resolve whether the initial send is included in the five attempts before asserting the final send count or implementing the DLQ threshold.
 - Guarantee at-least-once delivery, not exactly-once. A retry or manual replay uses the same event ID.
 - With a single worker, process oldest events first and preserve ordering for a given order. Do not promise global ordering or ordering with multiple workers.
 - Do not add outbound rate limiting in this version; observe the effect of bursts and decide later whether it is needed.
@@ -200,7 +215,7 @@ Per-endpoint status filters avoid creating deliveries that a customer did not re
 - A separate worker starts with its own Prisma client and the same database connection configuration as the API.
 - Every two seconds, it retrieves the oldest pending batch and sends each delivery with a 10-second timeout.
 - A 2xx response records a successful delivery and response time. A non-2xx response, connection failure, or timeout records a failed attempt and schedules the next retry.
-- The event remains eligible for delivery until a successful 2xx or exhaustion of the five retries. Exhausted events are copied to the DLQ with failure details.
+- The event remains eligible for delivery until a successful 2xx or exhaustion of the approved retry policy. Exhausted events are copied to the DLQ with failure details.
 - Requests are signed using HMAC-SHA256 and the endpoint-specific secret. The secret selected for signing during the 24-hour rotation overlap is an open technical decision.
 - The system does not guarantee global event ordering; per-order order is supported only while operating with a single worker.
 
@@ -259,14 +274,17 @@ Per-endpoint status filters avoid creating deliveries that a customer did not re
 - **Outbound rate limiting:** deferred; observe delivery bursts and decide later whether a limit is needed.
 - **Multiple-worker scaling and global ordering:** deferred. The initial operation uses one worker and does not promise global ordering.
 - **Exactly-once delivery:** explicitly not provided; delivery is at-least-once and consumers deduplicate with `X-Event-Id`.
+- **A separate `order.created` event:** the meeting discusses status-change notifications and status filters but does not clearly decide whether order creation is a separate event; resolve this before adding it to scope.
 
 ### Open Decisions Not Made into Requirements
 
 - Worker batch size.
 - Secret protection at rest and the signing-key selection during the 24-hour rotation overlap.
+- Whether a separate `order.created` event is in scope.
 - Exact retention/archive policy for delivery and outbox records.
 - Operational disposition for payloads that exceed 64 KB.
 - Whether outbound rate limiting is needed after observing production traffic.
+- Whether the initial send is included in the stated five attempts or is followed by five retries.
 
 ## 8. Dependency Graph
 
@@ -321,10 +339,10 @@ graph TD
 ### F02. Transactional Order Event Capture
 
 - For each active endpoint subscribed to a changed status, a matching `order.status_changed` snapshot is inserted in the same transaction as the order, history, and inventory updates.
-- For each active endpoint subscribed to `PENDING`, order creation inserts a distinct `order.created` event with `from_status: null` and `to_status: PENDING`.
 - An endpoint that is inactive or not subscribed to the applicable status receives no new outbox record.
 - A successful source transaction commits its eligible outbox records; a rollback leaves neither a committed source change nor an orphaned event.
 - An event payload contains the agreed order fields and excludes order items. Updating the order after enqueue does not change the stored snapshot.
+- A separate `order.created` event is not part of this acceptance criterion until its scope is explicitly decided.
 
 ### F03. Asynchronous Signed Delivery and Retry
 
@@ -332,7 +350,7 @@ graph TD
 - A request uses HTTPS, JSON, HMAC-SHA256 over the body, and the required `X-Event-Id`, `X-Webhook-Id`, `X-Timestamp`, `X-Signature`, and `Content-Type` headers.
 - The request body contains the agreed snapshot fields, does not include order items, and is not sent or truncated if it exceeds 64 KB.
 - A 2xx response is recorded as successful. A timeout after 10 seconds, connection failure, or 3xx/4xx/5xx response is recorded as failed and schedules the next retry.
-- A failed initial send is followed by five retries at 1 minute, 5 minutes, 30 minutes, 2 hours, and 12 hours; failure of the final retry moves the event to a separate DLQ record with payload, reason, and timestamp.
+- Apply the agreed retry-delay sequence of 1 minute, 5 minutes, 30 minutes, 2 hours, and 12 hours. Resolve whether the initial send is included in the five attempts before asserting the final send count and DLQ threshold.
 - Retries and manual replay preserve the event UUID in `X-Event-Id`; the delivery contract does not claim exactly-once behavior.
 - With one worker, events for the same order are processed in order; no global ordering guarantee is made.
 - The system records delivery outcomes and response times for history retrieval.
@@ -352,8 +370,8 @@ graph TD
 ### Test and Release Strategy
 
 - Exercise URL validation, status/event filtering, one-time secret visibility, retention of the old secret for 24 hours after rotation, and role enforcement through API-level tests. The signing-key selection during overlap remains open.
-- Exercise order creation and status transitions against the database to verify that order, history, inventory, and eligible outbox records commit or roll back together.
-- Use controlled destination responses to verify 2xx success, 3xx/4xx/5xx failures, connection errors, the 10-second timeout, each retry interval, and final DLQ persistence.
+- Exercise status transitions against the database to verify that order, history, inventory, and eligible outbox records commit or roll back together. Add order-creation cases only if that event is approved.
+- Use controlled destination responses to verify 2xx success, 3xx/4xx/5xx failures, connection errors, the 10-second timeout, each retry interval, and final DLQ persistence after the attempt-count interpretation is approved.
 - Verify HMAC headers and payload fields, the 64 KB rejection boundary, per-order processing order with a single worker, and the absence of an exactly-once promise.
 - Verify delivery-history contents and limit, administrator attribution, and replay with the same event ID.
 - Complete the planned security review with at least two business days reserved before deployment.

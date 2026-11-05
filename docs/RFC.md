@@ -4,7 +4,7 @@
 
 | Field | Value |
 |---|---|
-| Author | TBD |
+| Author | Rogerio Aguiar |
 | Status | Proposed — Submitted for Review |
 | Date | 2026-11-05 |
 | Reviewers | Larissa (Tech Lead), Marcos (Product Manager), Bruno (Orders Engineer), Diego (Platform Engineer), Sofia (Security Engineer) |
@@ -21,7 +21,7 @@ Atlas Comercial, MaxDistribuição, and Nova Cargo requested real-time order sta
 
 The current order service performs order creation and status changes in Prisma transactions. In particular, status changes update the order, write status history, and adjust stock within the transaction ([`src/modules/orders/order.service.ts`](../src/modules/orders/order.service.ts)). Calling customer endpoints synchronously from that path could block order processing or fail independently of the database transaction ([09:03]–[09:06] Bruno, Larissa, Diego).
 
-The existing application uses domain modules and shared Express middleware; examples include [`src/modules/orders/order.routes.ts`](../src/modules/orders/order.routes.ts), [`src/middlewares/error.middleware.ts`](../src/middlewares/error.middleware.ts), and [`src/shared/logger/index.ts`](../src/shared/logger/index.ts). The [README](../README.md) describes the current application as having no external notifications, events, queues, or webhooks.
+The source tree has no webhook domain module or webhook persistence model. Existing domain and shared patterns include [`src/modules/orders/order.routes.ts`](../src/modules/orders/order.routes.ts), [`src/middlewares/error.middleware.ts`](../src/middlewares/error.middleware.ts), and [`src/shared/logger/index.ts`](../src/shared/logger/index.ts); the current Prisma schema is [`prisma/schema.prisma`](../prisma/schema.prisma).
 
 ## Technical Proposal
 
@@ -42,8 +42,8 @@ This design reuses MySQL and the project's existing application conventions rath
 
 ## Open Questions
 
-1. **Retry-count interpretation:** The meeting specifies five scheduled delays, but its summary calls this “five attempts” ([09:15]–[09:17], [09:48] Larissa). The PRD specifies five retries *after* the initial send. Confirm whether the initial send is included in the five attempts or precedes five retries; this RFC does not resolve the wording difference.
-2. **Order creation events:** The PRD includes a distinct `order.created` notification for endpoints subscribed to `PENDING`. The meeting discusses status filters and status-change notifications ([09:31]–[09:34], [09:43]) but does not clearly settle a separate creation event. Confirm whether this event is in scope.
+1. **Retry-count interpretation:** The meeting specifies five scheduled delays, but its summary calls this “five attempts” ([09:15]–[09:17], [09:48] Larissa). Confirm whether the initial send is included in the five attempts or precedes five retries; this RFC does not resolve the wording difference.
+2. **Order creation events:** The PRD does not include a distinct `order.created` notification in the baseline because the meeting discusses status filters and status-change notifications ([09:31]–[09:34], [09:43]) but does not clearly settle a separate creation event. Confirm whether this event should be added before implementation.
 3. **Worker batch size:** The meeting calls for a small batch but does not set its size ([09:08] Diego). Select a value during design without changing the agreed polling interval.
 4. **Deferred operational policies:** The team deferred outbound rate limiting until traffic is observed ([09:38]–[09:39] Diego, Larissa) and left record archival/retention for later, mentioning approximately 30 days only as an example ([09:08] Diego). Decide these policies based on operational evidence; no specific limit or retention period is agreed here.
 

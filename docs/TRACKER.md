@@ -1,13 +1,20 @@
+Coverage is tracked once per distinct requirement, decision, constraint, trade-off, or open question. Repeated explanatory prose and illustrative examples are not counted as separate items when they express the same tracked item. Proposed implementation details that are not approved are labeled as proposals in the FDD and are not represented as meeting decisions.
+
 | ID | Documento | Tipo | Conteúdo (resumo) | Fonte | Localização |
 | --- | --- | --- | --- | --- | --- |
 | PRD-PROBLEM-01 | docs/PRD.md | Problem | Three B2B customers poll `GET /orders`, making their integrations slower and more expensive. | TRANSCRICAO | [09:00] Marcos |
 | PRD-PROBLEM-02 | docs/PRD.md | Acceptance Criterion | Customers consider delivery under 10 seconds to be real time. | TRANSCRICAO | [09:02] Marcos |
 | PRD-PROBLEM-03 | docs/PRD.md | Scope Constraint | Webhooks are outbound only; customers receive notifications and do not send webhook events to the OMS. | TRANSCRICAO | [09:02] Marcos |
-| PRD-FR-01 | docs/PRD.md | Functional Requirement | Customers can select order statuses and matching events are filtered before outbox insertion. | TRANSCRICAO | [09:33] Marcos; [09:34] Bruno |
-| PRD-FR-02 | docs/PRD.md | Functional Requirement | Customers can create webhook configurations; the API generates and returns the endpoint secret at creation. | TRANSCRICAO | [09:31] Marcos |
-| PRD-FR-03 | docs/PRD.md | Functional Requirement | Customers can update, delete, and list webhook configurations. | TRANSCRICAO | [09:33] Bruno |
-| PRD-FR-04 | docs/PRD.md | Functional Requirement | Customers can inspect the latest 100 delivery records, including outcome, payload, response, and response time. | TRANSCRICAO | [09:34] Marcos |
-| PRD-FR-05 | docs/PRD.md | Functional Requirement | Failed deliveries can be replayed manually through an administrator endpoint. | TRANSCRICAO | [09:18] Diego; [09:19] Larissa |
+| PRD-FR-01 | docs/PRD.md | Functional Requirement | Authenticated users can create, list, update, and delete customer-scoped webhook configurations. | TRANSCRICAO | [09:31]–[09:33] Marcos, Bruno |
+| PRD-FR-02 | docs/PRD.md | Functional Requirement | Each endpoint stores a list of order statuses, with filtering before outbox insertion. | TRANSCRICAO | [09:33]–[09:34] Marcos, Bruno |
+| PRD-FR-03 | docs/PRD.md | Functional Requirement | Eligible status-change events are written to the MySQL outbox in the same transaction as the order change. | TRANSCRICAO | [09:06] Diego; [09:40]–[09:41] Bruno, Diego |
+| PRD-FR-04 | docs/PRD.md | Functional Requirement | A separate worker polls the outbox every two seconds and processes older pending events first. | TRANSCRICAO | [09:09]–[09:12] Diego, Larissa |
+| PRD-FR-05 | docs/PRD.md | Functional Requirement | Outbound requests use HMAC-SHA256 with a unique secret per endpoint, a 24-hour rotation overlap, and HTTPS destinations. | TRANSCRICAO | [09:20]–[09:23] Sofia |
+| PRD-FR-06 | docs/PRD.md | Functional Requirement | The JSON payload contains the agreed order/event fields, excludes order items, and is rejected rather than truncated above 64 KB. | TRANSCRICAO | [09:23]–[09:24], [09:43] Diego, Larissa |
+| PRD-FR-07 | docs/PRD.md | Functional Requirement | Failed deliveries use the agreed delay sequence and exhausted deliveries are persisted in a separate DLQ; attempt-count interpretation remains open. | TRANSCRICAO | [09:15]–[09:19] Diego, Bruno, Larissa |
+| PRD-FR-08 | docs/PRD.md | Functional Requirement | Authenticated users can inspect the latest 100 delivery records, including outcome, payload, response, and response time. | TRANSCRICAO | [09:34] Marcos |
+| PRD-FR-09 | docs/PRD.md | Functional Requirement | An administrator can replay a DLQ record through an admin endpoint and the replay action records the actor. | TRANSCRICAO | [09:18]–[09:19] Diego, Larissa; [09:36] Sofia |
+| PRD-FR-10 | docs/PRD.md | Functional Requirement | Delivery is at-least-once, and customers deduplicate repeats using the stable `X-Event-Id`. | TRANSCRICAO | [09:24]–[09:26] Diego, Bruno, Larissa |
 | PRD-SEC-01 | docs/PRD.md | Security Requirement | Sign request bodies with HMAC-SHA256 using a unique secret per endpoint, with a 24-hour rotation overlap. | TRANSCRICAO | [09:20] Sofia; [09:21] Sofia; [09:22] Sofia |
 | PRD-SEC-02 | docs/PRD.md | Security Requirement | Webhook destination URLs must use HTTPS; HTTP destinations are rejected. | TRANSCRICAO | [09:23] Sofia |
 | PRD-NFR-01 | docs/PRD.md | Non-Functional Requirement | Reject payloads above the agreed 64 KB limit rather than truncate them. | TRANSCRICAO | [09:23] Sofia; [09:24] Diego |
@@ -67,6 +74,13 @@
 | FDD-SEC-04 | docs/FDD.md | Non-Functional Requirement | Reject payloads exceeding 64 KB instead of truncating them. | TRANSCRICAO | [09:23] Sofia; [09:24] Larissa |
 | FDD-DELIVERY-01 | docs/FDD.md | Delivery Guarantee | At-least-once delivery permits duplicates; the customer deduplicates with the stable `X-Event-Id`. | TRANSCRICAO | [09:24] Diego; [09:25] Diego |
 | FDD-DELIVERY-02 | docs/FDD.md | Ordering Constraint | A single worker processes events by creation order; no global ordering or multi-worker guarantee is made. | TRANSCRICAO | [09:12] Diego; [09:13] Larissa |
+| FDD-OPEN-01 | docs/FDD.md | Open Question | The meeting does not resolve whether a distinct `order.created` notification is in scope. | TRANSCRICAO | [09:31]–[09:34] Marcos, Bruno, Diego |
+| FDD-OPEN-02 | docs/FDD.md | Open Question | The meeting's five-attempt summary and five delay values do not settle whether the initial send is included. | TRANSCRICAO | [09:17] Diego; [09:48] Larissa |
+| FDD-OPEN-03 | docs/FDD.md | Open Question | Worker batch size was described as small but was not specified. | TRANSCRICAO | [09:08] Diego |
+| FDD-OPEN-04 | docs/FDD.md | Open Question | The sender's signing-secret selection during the 24-hour rotation overlap was not specified. | TRANSCRICAO | [09:21]–[09:22] Sofia, Diego |
+| FDD-OPEN-05 | docs/FDD.md | Open Question | The meeting requires rejecting oversized payloads but does not settle their persistence or retry disposition. | TRANSCRICAO | [09:23]–[09:24] Sofia, Diego, Larissa |
+| FDD-OPEN-06 | docs/FDD.md | Open Question | Outbox archival/retention was left outside scope; approximately 30 days was only an example. | TRANSCRICAO | [09:08] Diego |
+| FDD-OPEN-07 | docs/FDD.md | Open Question | Outbound rate limiting was deferred pending observation of traffic. | TRANSCRICAO | [09:38]–[09:39] Diego, Larissa |
 | FDD-CODE-01 | docs/FDD.md | Code Integration | Order creation and `changeStatus` already use Prisma transactions, and status changes update order history and stock. | CODIGO | src/modules/orders/order.service.ts |
 | FDD-CODE-02 | docs/FDD.md | Code Integration | Existing order status transitions and stock debit/replenishment rules are defined in the order status module. | CODIGO | src/modules/orders/order.status.ts |
 | FDD-CODE-03 | docs/FDD.md | Code Convention | Prisma models use UUID identifiers and define the existing order status and user-role enums. | CODIGO | prisma/schema.prisma |

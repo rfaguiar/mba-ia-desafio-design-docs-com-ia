@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Accepted for the delay sequence and separate DLQ; attempt count pending clarification
 
 ## Context
 
@@ -10,9 +10,9 @@ Customer endpoints may be unavailable for hours. Retrying indefinitely could lea
 
 ## Decision
 
-After a failed delivery, use the agreed retry-delay sequence of 1 minute, 5 minutes, 30 minutes, 2 hours, and 12 hours. After the final scheduled retry fails, persist the event, failure reason, and timestamp in a separate dead-letter table. Allow an administrator to request manual replay.
+After a failed delivery, use the agreed retry-delay sequence of 1 minute, 5 minutes, 30 minutes, 2 hours, and 12 hours. Persist an exhausted event, its failure reason, and timestamp in a separate dead-letter table. Allow an administrator to request manual replay.
 
-The meeting summary calls the policy "five attempts," while the PRD defines five retries after the initial send. Whether the initial send is included in the count remains to be reconciled; this ADR does not resolve that discrepancy.
+The meeting summary calls the policy "five attempts" ([09:17], [09:48]), while listing five delay values. Whether the initial send is included in the count remains unresolved; this ADR does not define the total number of sends or the DLQ threshold.
 
 ## Alternatives Considered
 
@@ -25,7 +25,7 @@ The meeting summary calls the policy "five attempts," while the PRD defines five
 - Temporary outages receive a bounded retry window, and exhausted events remain available for operator investigation and replay.
 - The system does not guarantee delivery if an endpoint remains unavailable after retries.
 - The separate dead-letter table adds persistence and replay lifecycle responsibilities.
-- The transcript and PRD differ on whether the initial send counts toward the stated five attempts; implementation must use a clarified count.
+- Implementation of the retry counter and DLQ threshold is blocked until the initial-send/attempt-count interpretation is clarified.
 - Other operational details beyond the retry schedule, dead-letter record, and manual replay remain unspecified.
 
 ## References
