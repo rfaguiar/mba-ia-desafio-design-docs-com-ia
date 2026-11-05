@@ -6,7 +6,7 @@
 
 Ative e siga a skill disponível **`prd-writer`** para conduzir a criação do PRD. Comece pela Fase 1 da skill: confirme em uma frase o entendimento do produto e explore o contexto do repositório. Siga as fases e os procedimentos da skill, incluindo a entrevista iterativa, a validação antes de salvar e a conferência do arquivo final.
 
-Não acione `spec-writer` nem `implement-feature`: esta tarefa é exclusivamente a produção do PRD, não a especificação técnica detalhada nem a implementação de código.
+Não acione `spec-writer`: esta tarefa é exclusivamente a produção do PRD, não a especificação técnica detalhada nem a implementação de código.
 
 ## Contexto e objetivo
 
